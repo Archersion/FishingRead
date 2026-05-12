@@ -27,7 +27,6 @@ BOOKSHELF_TIMEOUT = 3
 CHAPTER_LIST_TIMEOUT = 10
 CHAPTER_CONTENT_TIMEOUT = 5
 PROGRESS_SYNC_TIMEOUT = 3
-CHAPTER_PROGRESS_BOTTOM = 100
 LEGACY_CONFIG_KEYS = (
     "opacity",
     "show_in_alt_tab",
@@ -689,8 +688,6 @@ class SettingsDialog(QDialog):
             "auto_mode": self.check_auto_mode.isChecked(),
             "antishot_mode": self.check_antishot.isChecked(),
         })
-        for key in LEGACY_CONFIG_KEYS:
-            self.config.pop(key, None)
         super().accept()
 
     def reject(self):
@@ -728,6 +725,9 @@ class FishingRead(QWidget):
         self.is_chapter_loading = False
         self.chapter_request_token = 0
         self.current_chapter_progress = 0
+        self._progress_restore = None  # 章节加载后要恢复的字符位置（不含标题前缀）
+        self._current_content_raw_length = 0   # 当前章节原始内容长度（不含标题前缀）
+        self._current_title_prefix_len = 0     # 当前章节标题前缀长度
 
         # --- 本地书籍数据 ---
         self.is_local_mode = False  # 模式标记
@@ -738,7 +738,6 @@ class FishingRead(QWidget):
 
         # --- 界面控制 ---
         self.single_line_height = 20
-        self.is_mouse_in = False
         self.ghost_text_visible = True
         self.current_display_text = ""
         self.current_scroll_value = 0
@@ -1078,6 +1077,31 @@ class FishingRead(QWidget):
             QTimer.singleShot(delay, lambda is_bottom=is_bottom, token=token: self.apply_content_scroll_position(is_bottom, token))
         QTimer.singleShot(350, lambda token=token: self.clear_pending_content_scroll_anchor(token))
 
+    def _schedule_progress_restore_scroll(self, display_char_pos):
+        """按字符位置恢复滚动，延迟等待文本布局稳定。"""
+        token = self.chapter_request_token
+        for delay in (0, 100, 300):
+            QTimer.singleShot(delay, lambda p=display_char_pos, t=token: self._apply_char_pos_scroll(p, t))
+
+    def _apply_char_pos_scroll(self, display_char_pos, token):
+        """将 QTextEdit 滚动到指定字符位置在视口顶部。"""
+        if token != self.chapter_request_token:
+            return
+        doc = self.text_edit.document()
+        max_pos = doc.characterCount() - 1
+        target = min(display_char_pos, max_pos)
+        if target <= 0:
+            return
+
+        cursor = QTextCursor(doc)
+        cursor.setPosition(target)
+        self.text_edit.setTextCursor(cursor)
+
+        # 计算光标矩形并调整滚动，使光标位于视口顶部
+        cursor_rect = self.text_edit.cursorRect(cursor)
+        scrollbar = self.text_edit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.value() + cursor_rect.top())
+
     def clear_pending_content_scroll_anchor(self, token):
         if self.pending_content_scroll_anchor and self.pending_content_scroll_anchor[1] == token:
             self.pending_content_scroll_anchor = None
@@ -1100,25 +1124,41 @@ class FishingRead(QWidget):
             return
 
         self.set_text_edit_content(text)
-        self.schedule_content_scroll_position(is_bottom)
+
+        # 如果设置了进度恢复，按百分比滚动而非默认的顶部/底部
+        if self._progress_restore is not None:
+            progress = self._progress_restore
+            self._progress_restore = None  # 消费掉，避免重复触发
+            self._schedule_progress_restore_scroll(progress)
+        else:
+            self.schedule_content_scroll_position(is_bottom)
 
     def on_bookshelf_updated(self, books):
         self.books = books
         if self.book_selector_dialog and self.book_selector_dialog.isVisible():
             self.book_selector_dialog.update_data(books)
 
-    def on_chapter_loaded(self, chapter_index, full_text, scroll_to_bottom, request_token, progress_pos):
+    def on_chapter_loaded(self, chapter_index, full_text, scroll_to_bottom, request_token, display_char_pos):
         if request_token != self.chapter_request_token:
             return
 
         self.is_chapter_loading = False
         self.current_chapter_index = chapter_index
-        self.current_chapter_progress = self.clamp_chapter_progress(progress_pos)
+
+        # 存储显示字符位置（含标题前缀），用于文本渲染后恢复滚动
+        self._progress_restore = None
+        if not scroll_to_bottom and display_char_pos > 0:
+            self._progress_restore = display_char_pos
+
+        # 同步到 Legado：存入当前视口位置的原始字符数（不含标题前缀）
+        raw_char_pos = max(0, display_char_pos - self._current_title_prefix_len) if not scroll_to_bottom else self._current_content_raw_length
+        self.current_chapter_progress = display_char_pos
         if self.current_book:
             self.current_book["durChapterIndex"] = chapter_index
-            self.current_book["durChapterPos"] = self.current_chapter_progress
+            self.current_book["durChapterPos"] = raw_char_pos
+
         self.update_text_signal.emit(full_text, scroll_to_bottom)
-        self.sync_progress_async(self.current_chapter_progress)
+        self.sync_progress_async(raw_char_pos)
 
     def on_chapter_load_failed(self, error_text, request_token):
         if request_token != self.chapter_request_token:
@@ -1126,27 +1166,6 @@ class FishingRead(QWidget):
 
         self.is_chapter_loading = False
         self.update_text_signal.emit(error_text, False)
-
-    def clamp_chapter_progress(self, progress):
-        try:
-            return max(0, min(100, int(progress)))
-        except (TypeError, ValueError):
-            return 0
-
-    def get_current_chapter_progress(self):
-        if self.is_local_mode or not self.current_book:
-            return 0
-
-        scrollbar = self.text_edit.verticalScrollBar()
-        maximum = scrollbar.maximum()
-        if maximum <= 0:
-            return self.current_chapter_progress
-
-        progress = round(scrollbar.value() * 100 / maximum)
-        return self.clamp_chapter_progress(progress)
-
-    def should_scroll_to_saved_bottom(self, progress):
-        return self.clamp_chapter_progress(progress) >= CHAPTER_PROGRESS_BOTTOM
 
     def parse_native_hotkey(self, hotkey_str):
         if not hotkey_str:
@@ -1704,14 +1723,12 @@ class FishingRead(QWidget):
                 self.render_local_page()
 
     def enterEvent(self, event):
-        self.is_mouse_in = True
         if self.config.get("ghost_mode", False):
             if self.should_show_text_on_enter():
                 self.set_ghost_text_visible(True)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.is_mouse_in = False
         if self.is_settings_open or self.is_resizing or self.is_moving: return
 
         global_pos = QCursor.pos()
@@ -1787,14 +1804,16 @@ class FishingRead(QWidget):
         self.is_local_mode = False  # 切换回网络模式
         self.current_book = book
         self.current_chapter_index = book.get('durChapterIndex', 0)
-        self.current_chapter_progress = self.clamp_chapter_progress(book.get('durChapterPos', 0))
+        # 原始字符位移量，在线程中按内容转换为渲染文本中的显示位置
+        raw_progress_pos = book.get('durChapterPos', 0)
+        self.current_chapter_progress = 0
         self.current_toc = []
         self.update_text_signal.emit(f"打开: {book['name']}", False)
         self.fetch_chapter_content(
             book['bookUrl'],
             self.current_chapter_index,
-            self.should_scroll_to_saved_bottom(self.current_chapter_progress),
-            self.current_chapter_progress
+            False,
+            raw_progress_pos
         )
         self.fetch_toc_silent(book['bookUrl'])
 
@@ -1829,24 +1848,46 @@ class FishingRead(QWidget):
                 raw_content = data.get("data", "")
                 content = raw_content.replace("<br>", "\n").replace("&nbsp;", " ")
 
-                full_text = f"【 {chapter_title} 】\n\n{content}"
+                title_prefix = f"【 {chapter_title} 】\n\n"
+                full_text = f"{title_prefix}{content}"
 
-                self.chapter_loaded_signal.emit(chapter_index, full_text, scroll_to_bottom, request_token, progress_pos)
+                # 存储元数据供主线程使用
+                self._current_content_raw_length = len(content)
+                self._current_title_prefix_len = len(title_prefix)
+
+                # 计算在渲染文本中的显示字符位置（标题偏移 + 章节内字符偏移）
+                if content and progress_pos > 0:
+                    display_char_pos = len(title_prefix) + min(progress_pos, len(content))
+                else:
+                    display_char_pos = 0
+
+                self.chapter_loaded_signal.emit(
+                    chapter_index, full_text, scroll_to_bottom,
+                    request_token, display_char_pos
+                )
             else:
                 self.chapter_load_failed_signal.emit(f"HTTP错误: {res.status_code}", request_token)
         except Exception as e:
             self.chapter_load_failed_signal.emit(f"网络错误: {str(e)}", request_token)
 
-    def sync_progress_async(self, progress_pos=None):
+    def sync_progress_async(self, char_pos=None):
         if not self.current_book or self.is_local_mode:
             return
 
-        progress = self.clamp_chapter_progress(
-            self.get_current_chapter_progress() if progress_pos is None else progress_pos
-        )
-        self.current_chapter_progress = progress
+        if char_pos is None:
+            # 从视口顶部的光标位置计算原始章节内字符数
+            cursor = self.text_edit.cursorForPosition(QPoint(0, 0))
+            char_pos = max(0, cursor.position() - self._current_title_prefix_len)
+
+        # 限制在有效范围内
+        if self._current_content_raw_length > 0:
+            char_pos = min(char_pos, self._current_content_raw_length)
+        else:
+            char_pos = max(0, char_pos)
+
         self.current_book["durChapterIndex"] = self.current_chapter_index
-        self.current_book["durChapterPos"] = progress
+        self.current_book["durChapterPos"] = char_pos
+        self.current_chapter_progress = char_pos
 
         title = ""
         if self.current_toc and 0 <= self.current_chapter_index < len(self.current_toc):
@@ -1859,21 +1900,20 @@ class FishingRead(QWidget):
         ip = self.config['ip']
         threading.Thread(
             target=self._sync_task,
-            args=(book, chapter_index, title, progress, ip),
+            args=(book, chapter_index, title, char_pos, ip),
             daemon=True
         ).start()
 
     def _sync_task(self, book, chapter_index, title, progress, ip):
         try:
-            data = book.copy()
-            data.update({
+            data = {
                 "name": book['name'],
                 "author": book['author'],
                 "durChapterIndex": chapter_index,
                 "durChapterPos": progress,
                 "durChapterTime": book.get("durChapterTime", int(time.time() * 1000)),
-                "durChapterTitle": title
-            })
+                "durChapterTitle": title,
+            }
             url = f"{ip}/saveBookProgress"
             requests.post(url, json=data, timeout=PROGRESS_SYNC_TIMEOUT)
         except requests.RequestException:
@@ -1883,7 +1923,7 @@ class FishingRead(QWidget):
         # 【新增保护】防止 current_book 为 None
         if not self.current_book or self.is_chapter_loading:
             return
-        self.sync_progress_async(CHAPTER_PROGRESS_BOTTOM)
+        self.sync_progress_async(self._current_content_raw_length)
         next_index = self.current_chapter_index + 1
         self.current_chapter_index = next_index
         self.update_text_signal.emit("加载下一章...", False)
@@ -1902,7 +1942,7 @@ class FishingRead(QWidget):
                 self.current_book['bookUrl'],
                 prev_index,
                 True,
-                CHAPTER_PROGRESS_BOTTOM
+                0
             )
 
     def is_in_resize_area(self, pos):
@@ -2013,6 +2053,7 @@ class FishingRead(QWidget):
 
     def quit_app(self):
         # 退出前强制保存阅读进度和窗口位置
+        self.sync_progress_async()
         if self.is_local_mode:
             self.config["last_local_pos"] = self.local_start_index
         self.save_config()
