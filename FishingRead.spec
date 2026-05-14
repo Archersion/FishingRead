@@ -5,8 +5,11 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[('read.ico', '.')],  # 打包图标文件，供托盘图标使用
+    hiddenimports=[
+        'PyQt5.QtSvg',           # _render_svg_icon 中动态导入
+        'PyQt5.sip',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

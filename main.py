@@ -2,6 +2,7 @@
 import requests
 import json
 import os
+import logging
 import threading
 import time
 import ctypes
@@ -290,6 +291,23 @@ def get_app_icon():
 
     return QIcon()
 
+
+def setup_file_logging():
+    """将错误日志写入文件（打包后无控制台时同样可查）。"""
+    try:
+        if getattr(sys, "frozen", False):
+            log_dir = os.path.dirname(sys.executable)
+        else:
+            log_dir = os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(log_dir, "鱼阅.log")
+        logging.basicConfig(
+            filename=log_path,
+            level=logging.ERROR,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 # ================= Windows 防截屏 API 封装 =================
@@ -752,6 +770,8 @@ class FishingRead(QWidget):
         self.registered_hotkey_ids = set()
         self.book_selector_dialog = None
         self.oldPos = QPoint(0, 0)
+        self._startup_guard = True  # 阻止 ghost 模式在首次显示时立即隐藏窗口
+        self._first_show = True     # 标记是否首次显示
 
         self.chameleon_timer = QTimer(self)
         self.chameleon_timer.setInterval(500)
@@ -767,7 +787,12 @@ class FishingRead(QWidget):
         self.chapter_loaded_signal.connect(self.on_chapter_loaded)
         self.chapter_load_failed_signal.connect(self.on_chapter_load_failed)
 
-        self.refresh_hotkeys()
+        # __init__ 中不注册原生热键（HWND 尚未稳定），在 showEvent 中延迟注册
+        # 但创建 QShortcut 实例（仅当窗口可见且聚焦时生效，early binding 无副作用）
+        self._create_qshortcuts()
+
+        # 释放启动守卫：延迟 1.5 秒后允许 ghost 模式隐藏窗口
+        QTimer.singleShot(1500, lambda: self._release_startup_guard())
 
         # 尝试恢复上次打开的本地文件
         if self.config.get("last_local_file") and os.path.exists(self.config["last_local_file"]):
@@ -781,6 +806,16 @@ class FishingRead(QWidget):
 
         if self.config.get("antishot_mode", False):
             QTimer.singleShot(100, lambda: set_window_protection(int(self.winId()), True))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 窗口首次显示后，重新注册原生热键，确保 HWND 有效
+        if self._first_show:
+            self._first_show = False
+            QTimer.singleShot(200, self.refresh_hotkeys)
+
+    def _release_startup_guard(self):
+        self._startup_guard = False
 
     def restore_last_local_file(self):
         path = self.config["last_local_file"]
@@ -1252,12 +1287,10 @@ class FishingRead(QWidget):
             return True
         return False
 
-    def refresh_hotkeys(self):
+    def _create_qshortcuts(self):
+        """仅创建 QShortcut 实例（不注册原生热键），可在窗口显示前安全调用。"""
         hotkey_str = self.config.get("boss_key", "Esc")
         focus_hotkey_str = self.config.get("focus_hotkey", "Ctrl+Shift+R")
-        self.unregister_native_hotkeys()
-        self.register_native_hotkey(self.HOTKEY_ID_BOSS, hotkey_str)
-        self.register_native_hotkey(self.HOTKEY_ID_FOCUS, focus_hotkey_str)
         try:
             if self.local_shortcut:
                 self.local_shortcut.setKey(QKeySequence())
@@ -1272,6 +1305,14 @@ class FishingRead(QWidget):
             self.focus_shortcut.activated.connect(self.reveal_window)
         except Exception:
             pass
+
+    def refresh_hotkeys(self):
+        hotkey_str = self.config.get("boss_key", "Esc")
+        focus_hotkey_str = self.config.get("focus_hotkey", "Ctrl+Shift+R")
+        self.unregister_native_hotkeys()
+        self.register_native_hotkey(self.HOTKEY_ID_BOSS, hotkey_str)
+        self.register_native_hotkey(self.HOTKEY_ID_FOCUS, focus_hotkey_str)
+        self._create_qshortcuts()
 
     def on_global_hotkey_triggered(self):
         self.hotkey_signal.emit()
@@ -1311,6 +1352,7 @@ class FishingRead(QWidget):
         if was_visible:
             self.show()
             self.apply_style()
+            self.refresh_hotkeys()  # setWindowFlags 可能重建原生窗口，需重新注册热键
             if self.config.get("antishot_mode", False):
                 set_window_protection(int(self.winId()), True)
 
@@ -1730,6 +1772,7 @@ class FishingRead(QWidget):
 
     def leaveEvent(self, event):
         if self.is_settings_open or self.is_resizing or self.is_moving: return
+        if self._startup_guard: return  # 启动期间不触发 ghost 隐藏，避免窗口消失
 
         global_pos = QCursor.pos()
         local_pos = self.mapFromGlobal(global_pos)
@@ -2063,8 +2106,19 @@ class FishingRead(QWidget):
 
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
-    ex = FishingRead()
-    ex.show()
-    sys.exit(app.exec_())
+    setup_file_logging()
+    try:
+        app = QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(False)
+        ex = FishingRead()
+        ex.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        logging.exception("程序启动失败: %s", e)
+        # 弹窗显示错误信息（方便用户截图汇报）
+        try:
+            from PyQt5.QtWidgets import QMessageBox
+            app = QApplication(sys.argv) if 'app' not in dir() else app
+            QMessageBox.critical(None, "启动失败", f"鱼阅启动时发生错误：\n{e}\n\n详情请查看同目录下的「鱼阅.log」文件。")
+        except Exception:
+            pass
