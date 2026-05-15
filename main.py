@@ -807,12 +807,33 @@ class FishingRead(QWidget):
         if self.config.get("antishot_mode", False):
             QTimer.singleShot(100, lambda: set_window_protection(int(self.winId()), True))
 
+        # 启动后延迟激活窗口，确保界面正常显示在最前（模拟按下"显示界面"快捷键）
+        QTimer.singleShot(200, self.startup_activate)
+
+    def startup_activate(self):
+        """启动后确保窗口已显示、热键已注册、窗口已激活置前。"""
+        if not self.isVisible():
+            self.showNormal()
+        # 注册全局热键（比 showEvent 更早，且 HWND 此时已稳定）
+        self.refresh_hotkeys()
+        # 激活窗口置前（与 reveal_window 逻辑一致）
+        self.raise_()
+        self.activateWindow()
+        try:
+            ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
+        except Exception:
+            pass
+        if self.config.get("auto_mode", False):
+            self.chameleon_timer.start()
+            self.adjust_color_to_background()
+        if self.config.get("antishot_mode", False):
+            set_window_protection(int(self.winId()), True)
+
     def showEvent(self, event):
         super().showEvent(event)
-        # 窗口首次显示后，重新注册原生热键，确保 HWND 有效
+        # 窗口首次显示标记已消费（热键注册统一在 startup_activate 中处理）
         if self._first_show:
             self._first_show = False
-            QTimer.singleShot(200, self.refresh_hotkeys)
 
     def _release_startup_guard(self):
         self._startup_guard = False
