@@ -15,7 +15,8 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QMenu,
                              QFrame, QTextEdit, QShortcut, QListWidget,
                              QComboBox,
                              QListWidgetItem, QLabel, QFontComboBox, QSizePolicy, QFileDialog)
-from PyQt5.QtCore import Qt, QPoint, QRect, pyqtSignal, QThread, QTimer, QEvent
+from PyQt5.QtCore import Qt, QPoint, QRect, pyqtSignal, QThread, QTimer, QEvent, QSharedMemory
+from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtGui import QFont, QColor, QCursor, QKeySequence, QPainter, QPen, QFontMetrics, QTextCursor, QTextBlockFormat, QIcon, QPixmap
 
 # 启用高分屏支持
@@ -719,6 +720,31 @@ class SettingsDialog(QDialog):
         super().reject()
 
 
+# ================= 单实例 IPC 常量 =================
+SINGLE_INSTANCE_SERVER = "FishingRead_IPC"
+
+
+def try_activate_existing_instance():
+    """检查是否已有实例在运行，有则激活其窗口并返回 True。"""
+    shared_mem = QSharedMemory(SINGLE_INSTANCE_SERVER)
+    if not shared_mem.attach():
+        return False, shared_mem  # 没有其他实例在运行
+
+    # 尝试连接 IPC 服务器，发送显示信号
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLE_INSTANCE_SERVER)
+    if socket.waitForConnected(1000):
+        socket.write(b"show")
+        socket.waitForBytesWritten(500)
+        socket.disconnectFromServer()
+        return True, shared_mem  # 已激活旧实例
+
+    # 服务器未响应，旧实例可能已崩溃，清理并继续
+    shared_mem.detach()
+    QLocalServer.removeServer(SINGLE_INSTANCE_SERVER)
+    return False, shared_mem
+
+
 # ================= 主程序 =================
 class FishingRead(QWidget):
     update_text_signal = pyqtSignal(str, bool)
@@ -787,6 +813,9 @@ class FishingRead(QWidget):
         self.chapter_loaded_signal.connect(self.on_chapter_loaded)
         self.chapter_load_failed_signal.connect(self.on_chapter_load_failed)
 
+        # 设置单实例 IPC 服务器（接收重复启动时的激活信号）
+        self.setup_ipc_server()
+
         # __init__ 中不注册原生热键（HWND 尚未稳定），在 showEvent 中延迟注册
         # 但创建 QShortcut 实例（仅当窗口可见且聚焦时生效，early binding 无副作用）
         self._create_qshortcuts()
@@ -828,6 +857,27 @@ class FishingRead(QWidget):
             self.adjust_color_to_background()
         if self.config.get("antishot_mode", False):
             set_window_protection(int(self.winId()), True)
+
+    # --- 单实例 IPC 服务器（接收重复启动时的激活信号） ---
+    def setup_ipc_server(self):
+        """启动 IPC 本地服务器，监听重复运行的激活请求。"""
+        QLocalServer.removeServer(SINGLE_INSTANCE_SERVER)
+        self.ipc_server = QLocalServer()
+        self.ipc_server.listen(SINGLE_INSTANCE_SERVER)
+        self.ipc_server.newConnection.connect(self._on_ipc_new_connection)
+
+    def _on_ipc_new_connection(self):
+        conn = self.ipc_server.nextPendingConnection()
+        if conn:
+            conn.readyRead.connect(lambda: self._handle_ipc_message(conn))
+
+    def _handle_ipc_message(self, conn):
+        data = conn.readAll().data()
+        if data == b"show":
+            # 重复启动时，激活已有窗口
+            self.reveal_window()
+            self.refresh_hotkeys()
+        conn.disconnectFromServer()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -2131,6 +2181,15 @@ if __name__ == '__main__':
     try:
         app = QApplication(sys.argv)
         app.setQuitOnLastWindowClosed(False)
+
+        # 单实例检查：如果已有实例，激活其窗口后立即退出
+        activated, shared_mem = try_activate_existing_instance()
+        if activated:
+            sys.exit(0)
+
+        # 标记当前实例为唯一实例
+        shared_mem.create(1)
+
         ex = FishingRead()
         ex.show()
         sys.exit(app.exec_())
