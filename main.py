@@ -29,6 +29,7 @@ BOOKSHELF_TIMEOUT = 3
 CHAPTER_LIST_TIMEOUT = 10
 CHAPTER_CONTENT_TIMEOUT = 5
 PROGRESS_SYNC_TIMEOUT = 3
+FUTURE_CHAPTER_CACHE_SIZE = 5
 LEGACY_CONFIG_KEYS = (
     "opacity",
     "show_in_alt_tab",
@@ -751,7 +752,7 @@ class FishingRead(QWidget):
     hotkey_signal = pyqtSignal()
     focus_hotkey_signal = pyqtSignal()
     bookshelf_updated_signal = pyqtSignal(list)
-    chapter_loaded_signal = pyqtSignal(int, str, bool, int, int)
+    chapter_loaded_signal = pyqtSignal(int, str, bool, int, int, int, int)
     chapter_load_failed_signal = pyqtSignal(str, int)
     HOTKEY_ID_BOSS = 1
     HOTKEY_ID_FOCUS = 2
@@ -772,6 +773,9 @@ class FishingRead(QWidget):
         self._progress_restore = None  # 章节加载后要恢复的字符位置（不含标题前缀）
         self._current_content_raw_length = 0   # 当前章节原始内容长度（不含标题前缀）
         self._current_title_prefix_len = 0     # 当前章节标题前缀长度
+        self.chapter_cache = {}
+        self.chapter_cache_lock = threading.Lock()
+        self.prefetching_chapters = set()
 
         # --- 本地书籍数据 ---
         self.is_local_mode = False  # 模式标记
@@ -1241,12 +1245,23 @@ class FishingRead(QWidget):
         if self.book_selector_dialog and self.book_selector_dialog.isVisible():
             self.book_selector_dialog.update_data(books)
 
-    def on_chapter_loaded(self, chapter_index, full_text, scroll_to_bottom, request_token, display_char_pos):
+    def on_chapter_loaded(
+        self,
+        chapter_index,
+        full_text,
+        scroll_to_bottom,
+        request_token,
+        display_char_pos,
+        raw_length,
+        title_prefix_len
+    ):
         if request_token != self.chapter_request_token:
             return
 
         self.is_chapter_loading = False
         self.current_chapter_index = chapter_index
+        self._current_content_raw_length = raw_length
+        self._current_title_prefix_len = title_prefix_len
 
         # 存储显示字符位置（含标题前缀），用于文本渲染后恢复滚动
         self._progress_restore = None
@@ -1254,7 +1269,7 @@ class FishingRead(QWidget):
             self._progress_restore = display_char_pos
 
         # 同步到 Legado：存入当前视口位置的原始字符数（不含标题前缀）
-        raw_char_pos = max(0, display_char_pos - self._current_title_prefix_len) if not scroll_to_bottom else self._current_content_raw_length
+        raw_char_pos = max(0, display_char_pos - title_prefix_len) if not scroll_to_bottom else raw_length
         self.current_chapter_progress = display_char_pos
         if self.current_book:
             self.current_book["durChapterIndex"] = chapter_index
@@ -1262,6 +1277,10 @@ class FishingRead(QWidget):
 
         self.update_text_signal.emit(full_text, scroll_to_bottom)
         self.sync_progress_async(raw_char_pos)
+        if self.current_book and not self.is_local_mode:
+            book_url = self.current_book.get('bookUrl')
+            self.trim_chapter_cache(book_url, chapter_index)
+            self.prefetch_future_chapters(book_url, chapter_index)
 
     def on_chapter_load_failed(self, error_text, request_token):
         if request_token != self.chapter_request_token:
@@ -1911,10 +1930,98 @@ class FishingRead(QWidget):
 
         self.apply_style()
 
+    def get_chapter_title(self, chapter_index):
+        if hasattr(self, 'current_toc') and self.current_toc:
+            if 0 <= chapter_index < len(self.current_toc):
+                return self.current_toc[chapter_index].get('title', '')
+        return f"第 {chapter_index + 1} 章"
+
+    def build_chapter_cache_entry(self, chapter_index, raw_content):
+        chapter_title = self.get_chapter_title(chapter_index)
+        content = raw_content.replace("<br>", "\n").replace("&nbsp;", " ")
+        title_prefix = f"【 {chapter_title} 】\n\n"
+        return {
+            "full_text": f"{title_prefix}{content}",
+            "raw_length": len(content),
+            "title_prefix_len": len(title_prefix),
+        }
+
+    def get_cached_chapter(self, book_url, chapter_index):
+        with self.chapter_cache_lock:
+            return self.chapter_cache.get((book_url, chapter_index))
+
+    def set_cached_chapter(self, book_url, chapter_index, entry):
+        with self.chapter_cache_lock:
+            self.chapter_cache[(book_url, chapter_index)] = entry
+
+    def clear_chapter_cache(self):
+        with self.chapter_cache_lock:
+            self.chapter_cache.clear()
+            self.prefetching_chapters.clear()
+
+    def trim_chapter_cache(self, book_url, chapter_index):
+        min_index = max(0, chapter_index - 1)
+        max_index = chapter_index + FUTURE_CHAPTER_CACHE_SIZE
+        with self.chapter_cache_lock:
+            stale_keys = [
+                key for key in self.chapter_cache
+                if key[0] != book_url or key[1] < min_index or key[1] > max_index
+            ]
+            for key in stale_keys:
+                self.chapter_cache.pop(key, None)
+
+    def calc_display_char_pos(self, entry, progress_pos):
+        if entry["raw_length"] > 0 and progress_pos > 0:
+            return entry["title_prefix_len"] + min(progress_pos, entry["raw_length"])
+        return 0
+
+    def prefetch_future_chapters(self, book_url, chapter_index):
+        if not book_url:
+            return
+
+        max_toc_index = len(self.current_toc) - 1 if self.current_toc else None
+        for offset in range(1, FUTURE_CHAPTER_CACHE_SIZE + 1):
+            next_index = chapter_index + offset
+            if max_toc_index is not None and next_index > max_toc_index:
+                break
+
+            cache_key = (book_url, next_index)
+            with self.chapter_cache_lock:
+                if cache_key in self.chapter_cache or cache_key in self.prefetching_chapters:
+                    continue
+                self.prefetching_chapters.add(cache_key)
+
+            threading.Thread(
+                target=self._prefetch_chapter_thread,
+                args=(book_url, next_index, cache_key),
+                daemon=True
+            ).start()
+
+    def _prefetch_chapter_thread(self, book_url, chapter_index, cache_key):
+        try:
+            url = f"{self.config['ip']}/getBookContent"
+            params = {'url': book_url, 'index': chapter_index}
+            res = requests.get(url, params=params, timeout=CHAPTER_CONTENT_TIMEOUT)
+            if res.status_code != 200:
+                return
+
+            data = res.json()
+            if not data.get("isSuccess"):
+                return
+
+            entry = self.build_chapter_cache_entry(chapter_index, data.get("data", ""))
+            self.set_cached_chapter(book_url, chapter_index, entry)
+        except Exception:
+            pass
+        finally:
+            with self.chapter_cache_lock:
+                self.prefetching_chapters.discard(cache_key)
+
     def load_book(self, book):
         self.is_local_mode = False  # 切换回网络模式
         self.current_book = book
         self.current_chapter_index = book.get('durChapterIndex', 0)
+        self.clear_chapter_cache()
         # 原始字符位移量，在线程中按内容转换为渲染文本中的显示位置
         raw_progress_pos = book.get('durChapterPos', 0)
         self.current_chapter_progress = 0
@@ -1932,20 +2039,27 @@ class FishingRead(QWidget):
         self.chapter_request_token += 1
         request_token = self.chapter_request_token
         self.is_chapter_loading = True
+
+        cached_entry = self.get_cached_chapter(book_url, chapter_index)
+        if cached_entry:
+            display_char_pos = self.calc_display_char_pos(cached_entry, progress_pos)
+            self.chapter_loaded_signal.emit(
+                chapter_index,
+                cached_entry["full_text"],
+                scroll_to_bottom,
+                request_token,
+                display_char_pos,
+                cached_entry["raw_length"],
+                cached_entry["title_prefix_len"],
+            )
+            return
+
         t = threading.Thread(target=self._fetch_chapter_thread,
                              args=(book_url, chapter_index, scroll_to_bottom, request_token, progress_pos), daemon=True)
         t.start()
 
     def _fetch_chapter_thread(self, book_url, chapter_index, scroll_to_bottom, request_token, progress_pos):
         try:
-            chapter_title = ""
-            if hasattr(self, 'current_toc') and self.current_toc:
-                if 0 <= chapter_index < len(self.current_toc):
-                    chapter_title = self.current_toc[chapter_index].get('title', '')
-
-            if not chapter_title:
-                chapter_title = f"第 {chapter_index + 1} 章"
-
             url = f"{self.config['ip']}/getBookContent"
             params = {'url': book_url, 'index': chapter_index}
             res = requests.get(url, params=params, timeout=CHAPTER_CONTENT_TIMEOUT)
@@ -1957,24 +2071,16 @@ class FishingRead(QWidget):
                     return
 
                 raw_content = data.get("data", "")
-                content = raw_content.replace("<br>", "\n").replace("&nbsp;", " ")
-
-                title_prefix = f"【 {chapter_title} 】\n\n"
-                full_text = f"{title_prefix}{content}"
-
-                # 存储元数据供主线程使用
-                self._current_content_raw_length = len(content)
-                self._current_title_prefix_len = len(title_prefix)
+                entry = self.build_chapter_cache_entry(chapter_index, raw_content)
+                self.set_cached_chapter(book_url, chapter_index, entry)
 
                 # 计算在渲染文本中的显示字符位置（标题偏移 + 章节内字符偏移）
-                if content and progress_pos > 0:
-                    display_char_pos = len(title_prefix) + min(progress_pos, len(content))
-                else:
-                    display_char_pos = 0
+                display_char_pos = self.calc_display_char_pos(entry, progress_pos)
 
                 self.chapter_loaded_signal.emit(
-                    chapter_index, full_text, scroll_to_bottom,
-                    request_token, display_char_pos
+                    chapter_index, entry["full_text"], scroll_to_bottom,
+                    request_token, display_char_pos, entry["raw_length"],
+                    entry["title_prefix_len"]
                 )
             else:
                 self.chapter_load_failed_signal.emit(f"HTTP错误: {res.status_code}", request_token)
