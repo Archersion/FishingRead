@@ -29,6 +29,8 @@ BOOKSHELF_TIMEOUT = 3
 CHAPTER_LIST_TIMEOUT = 10
 CHAPTER_CONTENT_TIMEOUT = 5
 PROGRESS_SYNC_TIMEOUT = 3
+PROGRESS_AUTO_SAVE_INTERVAL = 30
+PROGRESS_AUTO_SAVE_CHECK_INTERVAL = 5
 FUTURE_CHAPTER_CACHE_SIZE = 5
 LEGACY_CONFIG_KEYS = (
     "opacity",
@@ -770,6 +772,7 @@ class FishingRead(QWidget):
         self.is_chapter_loading = False
         self.chapter_request_token = 0
         self.current_chapter_progress = 0
+        self.last_progress_sync_time = time.monotonic()
         self._progress_restore = None  # 章节加载后要恢复的字符位置（不含标题前缀）
         self._current_content_raw_length = 0   # 当前章节原始内容长度（不含标题前缀）
         self._current_title_prefix_len = 0     # 当前章节标题前缀长度
@@ -806,6 +809,11 @@ class FishingRead(QWidget):
         self.chameleon_timer = QTimer(self)
         self.chameleon_timer.setInterval(500)
         self.chameleon_timer.timeout.connect(self.adjust_color_to_background)
+
+        self.progress_auto_save_timer = QTimer(self)
+        self.progress_auto_save_timer.setInterval(PROGRESS_AUTO_SAVE_CHECK_INTERVAL * 1000)
+        self.progress_auto_save_timer.timeout.connect(self.auto_save_progress_if_needed)
+        self.progress_auto_save_timer.start()
 
         self.initUI()
         self.initTray()
@@ -2091,6 +2099,8 @@ class FishingRead(QWidget):
         if not self.current_book or self.is_local_mode:
             return
 
+        self.last_progress_sync_time = time.monotonic()
+
         if char_pos is None:
             # 从视口顶部的光标位置计算原始章节内字符数
             cursor = self.text_edit.cursorForPosition(QPoint(0, 0))
@@ -2135,6 +2145,15 @@ class FishingRead(QWidget):
             requests.post(url, json=data, timeout=PROGRESS_SYNC_TIMEOUT)
         except requests.RequestException:
             pass
+
+    def auto_save_progress_if_needed(self):
+        if self.is_local_mode or not self.current_book or self.is_chapter_loading:
+            return
+
+        if time.monotonic() - self.last_progress_sync_time < PROGRESS_AUTO_SAVE_INTERVAL:
+            return
+
+        self.sync_progress_async()
 
     def next_chapter(self):
         # 【新增保护】防止 current_book 为 None
