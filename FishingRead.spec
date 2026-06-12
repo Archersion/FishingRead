@@ -1,23 +1,38 @@
-# -*- mode: python ; coding: utf-8 -*-
+﻿# -*- mode: python ; coding: utf-8 -*-
 
+import sys
+import os
+
+block_cipher = None
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('read.ico', '.')],  # 打包图标文件，供托盘图标使用
+    datas=[
+        ('read.ico', '.'),
+    ],
     hiddenimports=[
-        'PyQt5.QtSvg',           # _render_svg_icon 中动态导入
-        'PyQt5.QtNetwork',       # 单实例 IPC 通信
+        'PyQt5.QtSvg',
+        'PyQt5.QtNetwork',
         'PyQt5.sip',
+        'fishingread',
+        'fishingread.core',
+        'fishingread.ui',
+        'fishingread.platform',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'matplotlib', 'PIL', 'pandas', 'numpy',
+        'scipy', 'cv2', 'tensorflow', 'torch',
+        'test', 'unittest', 'pdb',
+    ],
     noarchive=False,
-    optimize=0,
+    optimize=1,
 )
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
