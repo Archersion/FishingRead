@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QColorDialog, QFileDialog,
 )
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QColor
 
 from fishingread.constants import DARK_STYLESHEET, CHAPTER_LIST_TIMEOUT
 from fishingread.svg_icons import make_icon, add_menu_action
@@ -50,8 +50,17 @@ class BookSelector(QDialog):
         layout.addLayout(top)
 
         self.list_widget = QListWidget()
+        self.list_widget.itemActivated.connect(self.on_item_activated)
         self.list_widget.itemDoubleClicked.connect(self.on_item_double_clicked)
         layout.addWidget(self.list_widget)
+
+        bottom = QHBoxLayout()
+        btn_open = QPushButton("打开选中书籍")
+        btn_open.setIcon(make_icon("book-open", 16))
+        btn_open.clicked.connect(self.accept_current_book)
+        bottom.addStretch(1)
+        bottom.addWidget(btn_open)
+        layout.addLayout(bottom)
         self.setLayout(layout)
 
     def manual_refresh(self):
@@ -84,8 +93,23 @@ class BookSelector(QDialog):
         ]
         self.populate_list(filtered)
 
-    def on_item_double_clicked(self, item):
+    def select_book_item(self, item):
+        if not item:
+            return False
         self.selected_book = item.data(Qt.UserRole)
+        return bool(self.selected_book)
+
+    def accept_current_book(self):
+        if self.select_book_item(self.list_widget.currentItem()):
+            self.accept()
+
+    def on_item_activated(self, item):
+        if self.select_book_item(item):
+            self.accept()
+
+    def on_item_double_clicked(self, item):
+        if not self.select_book_item(item):
+            return
         self.accept()
 
 
@@ -272,10 +296,10 @@ class SettingsDialog(QDialog):
 
         # 颜色按钮
         self.btn_text_color = QPushButton("文字颜色 (手动)")
-        self.btn_text_color.setStyleSheet(f"background-color: {self.temp_text_color};")
+        self._apply_color_button_style(self.btn_text_color, self.temp_text_color)
         self.btn_text_color.clicked.connect(self.pick_text_color)
         self.btn_bg_color = QPushButton("背景颜色 (手动)")
-        self.btn_bg_color.setStyleSheet(f"background-color: {self.temp_bg_color};")
+        self._apply_color_button_style(self.btn_bg_color, self.temp_bg_color)
         self.btn_bg_color.clicked.connect(self.pick_bg_color)
         layout.addRow(self.btn_text_color, self.btn_bg_color)
 
@@ -353,17 +377,32 @@ class SettingsDialog(QDialog):
         if self.main_window:
             self.main_window.apply_style()
 
+    def _parse_qcolor(self, rgba_text, fallback):
+        color = QColor(rgba_text)
+        return color if color.isValid() else QColor(fallback)
+
+    def _apply_color_button_style(self, button, rgba_text):
+        color = self._parse_qcolor(rgba_text, "#444444")
+        brightness = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+        foreground = "#111111" if brightness > 150 else "#ffffff"
+        button.setStyleSheet(
+            f"background-color: {rgba_text}; color: {foreground}; "
+            "border: 1px solid #666; padding: 5px; border-radius: 4px;"
+        )
+
     def pick_text_color(self):
-        color = QColorDialog.getColor()
+        initial = self._parse_qcolor(self.temp_text_color, "#ffffff")
+        color = QColorDialog.getColor(initial, self, "选择文字颜色", QColorDialog.ShowAlphaChannel)
         if color.isValid():
             self.temp_text_color = f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alpha()})"
-            self.btn_text_color.setStyleSheet(f"background-color: {self.temp_text_color};")
+            self._apply_color_button_style(self.btn_text_color, self.temp_text_color)
 
     def pick_bg_color(self):
-        color = QColorDialog.getColor(options=QColorDialog.ShowAlphaChannel)
+        initial = self._parse_qcolor(self.temp_bg_color, "#1e1e1e")
+        color = QColorDialog.getColor(initial, self, "选择背景颜色", QColorDialog.ShowAlphaChannel)
         if color.isValid():
             self.temp_bg_color = f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alpha()})"
-            self.btn_bg_color.setStyleSheet(f"background-color: {self.temp_bg_color};")
+            self._apply_color_button_style(self.btn_bg_color, self.temp_bg_color)
 
     def accept(self):
         self.config.update({

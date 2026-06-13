@@ -12,7 +12,7 @@ from ctypes import wintypes
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QTextEdit, QShortcut,
-    QSystemTrayIcon,
+    QSystemTrayIcon, QDialog,
 )
 from PyQt5.QtCore import Qt, QPoint, QRect, QTimer, QEvent
 from PyQt5.QtGui import QFont, QColor, QCursor, QKeySequence, QFontMetrics, QTextCursor, QTextBlockFormat
@@ -76,8 +76,6 @@ class FishingRead(QWidget):
         # 网络阅读状态
         self._current_content_raw_length = 0
         self._current_title_prefix_len = 0
-        self.chapter_request_token = 0
-        self.current_chapter_progress = 0
         self.current_chapter_progress = 0
         self.network.bookshelf_updated.connect(self._on_bookshelf_updated)
         self.network.chapter_loaded.connect(self._on_chapter_loaded)
@@ -95,6 +93,7 @@ class FishingRead(QWidget):
 
         # 初始化 UI
         self._init_ui()
+        self._show_default_network_prompt()
         self.tray_icon = create_tray(self)
         self.tray_icon.show()
 
@@ -143,6 +142,12 @@ class FishingRead(QWidget):
         """单实例 IPC 收到激活请求时唤起窗口。"""
         self.reveal_window()
         self._refresh_hotkeys()
+
+    def _show_default_network_prompt(self):
+        """网络模式未选书时显示默认提示。"""
+        if not self.is_local_mode and not self.network.current_book:
+            self._on_local_update_text("请先选择一本书！", False)
+
     def showEvent(self, event):
         super().showEvent(event)
         if self._first_show:
@@ -285,13 +290,13 @@ class FishingRead(QWidget):
 
     def _schedule_progress_restore_scroll(self, display_char_pos):
         """按字符位置恢复滚动。"""
-        token = self.chapter_request_token
+        token = self.network.chapter_request_token
         for delay in (0, 100, 300):
             QTimer.singleShot(delay, lambda p=display_char_pos, t=token: self._apply_char_pos_scroll(p, t))
 
     def _apply_char_pos_scroll(self, display_char_pos, token):
         """将 QTextEdit 滚动到指定字符位置。"""
-        if token != self.chapter_request_token:
+        if token != self.network.chapter_request_token:
             return
         doc = self.text_edit.document()
         max_pos = doc.characterCount() - 1
@@ -534,15 +539,19 @@ class FishingRead(QWidget):
         self, chapter_index, full_text, scroll_to_bottom,
         request_token, display_char_pos, raw_length, title_prefix_len,
     ):
-        if request_token != self.chapter_request_token:
+        if request_token != self.network.chapter_request_token:
             return
         self.network.is_chapter_loading = False
         self.network.current_chapter_index = chapter_index
         self._current_content_raw_length = raw_length
         self._current_title_prefix_len = title_prefix_len
-
-        if not scroll_to_bottom and display_char_pos > 0:
-            self._schedule_progress_restore_scroll(display_char_pos)
+        self.network._current_content_raw_length = raw_length
+        self.network._current_title_prefix_len = title_prefix_len
+        raw_char_pos = max(0, display_char_pos - title_prefix_len) if not scroll_to_bottom else raw_length
+        self.network.current_chapter_progress = raw_char_pos
+        if self.network.current_book:
+            self.network.current_book["durChapterIndex"] = chapter_index
+            self.network.current_book["durChapterPos"] = raw_char_pos
 
         self.current_chapter_progress = display_char_pos
         self.current_display_text = full_text
@@ -552,12 +561,16 @@ class FishingRead(QWidget):
             self.text_edit.verticalScrollBar().setValue(0)
         else:
             self._set_text_edit_content(full_text)
+            if scroll_to_bottom:
+                self._schedule_scroll_position(True)
+            elif display_char_pos > 0:
+                self._schedule_progress_restore_scroll(display_char_pos)
 
         self.network.sync_progress_async()
         self._trim_and_prefetch()
 
     def _on_chapter_load_failed(self, error_text, request_token):
-        if request_token != self.chapter_request_token:
+        if request_token != self.network.chapter_request_token:
             return
         self.network.is_chapter_loading = False
         self.current_display_text = error_text
@@ -769,7 +782,6 @@ class FishingRead(QWidget):
         if toc.exec_() == QDialog.Accepted and toc.selected_index is not None:
             self.network.current_chapter_index = toc.selected_index
             self._on_local_update_text(f"跳转到章节: {toc.selected_index}", False)
-            self.chapter_request_token += 1
             self.network.fetch_chapter_content(
                 self.network.current_book["bookUrl"], toc.selected_index, False, 0,
             )
@@ -798,7 +810,7 @@ class FishingRead(QWidget):
     def _load_book(self, book):
         """加载网络书籍。"""
         self.is_local_mode = False
-        self.chapter_request_token += 1
+        self._on_local_update_text(f"打开: {book.get('name', '未知书籍')}", False)
         self.network.load_book(book)
 
     def on_toc_loaded(self, chapters):
