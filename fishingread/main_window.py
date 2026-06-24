@@ -69,6 +69,7 @@ class FishingRead(QWidget):
         self.oldPos = QPoint(0, 0)
         self._startup_guard = True
         self._first_show = True
+        self._last_hide_time = 0.0
         self.book_selector_dialog = None
 
         # 热键
@@ -136,6 +137,26 @@ class FishingRead(QWidget):
             self.adjust_color_to_background()
         if self.config.get("antishot_mode", False):
             set_window_protection(int(self.winId()), True)
+
+    def _reload_progress_on_reveal(self):
+        """如果隐藏超过自动保存间隔，重新读取阅读进度。"""
+        if self._last_hide_time <= 0:
+            return
+        if time.time() - self._last_hide_time < PROGRESS_AUTO_SAVE_CHECK_INTERVAL:
+            return
+
+        if self.is_local_mode:
+            last_file = self.config.get("last_local_file", "")
+            if last_file and os.path.exists(last_file):
+                pos = self.config.get("last_local_pos", 0)
+                self.load_local_file(last_file, pos)
+        elif self.network.current_book:
+            self.network.fetch_chapter_content(
+                self.network.current_book.get("bookUrl"),
+                self.network.current_chapter_index,
+                False,
+                self.network.current_chapter_progress,
+            )
 
     def _release_startup_guard(self):
         self._startup_guard = False
@@ -647,6 +668,10 @@ class FishingRead(QWidget):
         """定时自动保存阅读进度。"""
         from time import monotonic
 
+        # 窗口隐藏时不保存
+        if not self.isVisible():
+            return
+
         if self.is_local_mode:
             self.config["last_local_pos"] = self.local_reader.start_index
             self.save_config_to_disk()
@@ -713,11 +738,13 @@ class FishingRead(QWidget):
         self.last_toggle_time = current_time
         if self.isVisible():
             self.sync_progress_async()
+            self._last_hide_time = time.time()
             self.hide()
         else:
             self.showNormal()
             self.raise_()
             self.activateWindow()
+            self._reload_progress_on_reveal()
             self.apply_style()
             try:
                 ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
@@ -733,6 +760,7 @@ class FishingRead(QWidget):
         """显示并激活窗口（唤醒快捷键）。"""
         if not self.isVisible():
             self.showNormal()
+        self._reload_progress_on_reveal()
         if self.config.get("ghost_mode", False) and not self.ghost_text_visible:
             self._set_ghost_text_visible(True)
         else:
