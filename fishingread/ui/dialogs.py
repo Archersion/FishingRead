@@ -116,7 +116,6 @@ class BookSelector(QDialog):
 # ================== 目录加载线程 ==================
 
 from PyQt5.QtCore import QThread, pyqtSignal
-import requests
 
 
 class ChapterLoaderThread(QThread):
@@ -130,6 +129,7 @@ class ChapterLoaderThread(QThread):
         self.book_url = book_url
 
     def run(self):
+        import requests
         try:
             url = f"{self.ip}/getChapterList"
             res = requests.get(url, params={"url": self.book_url}, timeout=CHAPTER_LIST_TIMEOUT)
