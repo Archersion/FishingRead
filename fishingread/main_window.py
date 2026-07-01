@@ -171,11 +171,18 @@ class FishingRead(QWidget):
         if not self.is_local_mode and not self.network.current_book:
             self._on_local_update_text("请先选择一本书！", False)
 
+    def hideEvent(self, event):
+        """窗口隐藏时记录时间，覆盖所有隐藏路径（Esc、托盘菜单等）。"""
+        self._last_hide_time = time.time()
+        super().hideEvent(event)
+
     def showEvent(self, event):
+        """窗口显示时检查是否需要刷新进度。"""
         super().showEvent(event)
         if self._first_show:
             self._first_show = False
-        if self.isVisible():
+        if self.isVisible() and event.spontaneous():
+            self._reload_progress_on_reveal()
             self.raise_()
             self.activateWindow()
             try:
@@ -738,7 +745,6 @@ class FishingRead(QWidget):
         self.last_toggle_time = current_time
         if self.isVisible():
             self.sync_progress_async()
-            self._last_hide_time = time.time()
             self.hide()
         else:
             self.showNormal()
