@@ -1,0 +1,25 @@
+@import "./style.css";
+
+html, body.settings-page, body.settings-page #app {
+  min-width: 420px;
+  min-height: 480px;
+  overflow: hidden;
+  background: #181b20;
+}
+
+.settings-shell { display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; color: #d9dee5; background: #20242a; }
+.settings-header { display: flex; align-items: flex-start; justify-content: space-between; padding: 20px 28px 16px; border-bottom: 1px solid #353b44; user-select: none; }
+.settings-header p { margin: 0 0 5px; color: #7aa7ce; font-size: 10px; font-weight: 700; letter-spacing: 0.17em; }
+.settings-header h1 { margin: 0; color: #f0f3f6; font-size: 22px; }
+.settings-page .settings-form { display: grid; grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; overflow: hidden; }
+.settings-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 15px 16px; min-height: 0; padding: 22px 28px; overflow: auto; }
+.settings-footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; padding: 12px 28px; border-top: 1px solid #353b44; background: #20242a; }
+.settings-footer .form-actions { padding: 0; }
+.settings-message { min-height: 20px; margin: 0; color: #8fc59a; }
+.settings-message.error { color: #ef9aa4; }
+.settings-load-error { display: grid; min-height: 100%; place-content: center; padding: 30px; text-align: center; }
+
+@media (max-width: 540px) {
+  .settings-fields { grid-template-columns: 1fr; padding-inline: 18px; }
+  .settings-footer { padding-inline: 18px; }
+}
