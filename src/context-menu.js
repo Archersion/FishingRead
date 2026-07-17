@@ -21,7 +21,9 @@ let running = false;
 let closeOnBlur = false;
 
 function errorMessage(error) {
-  return typeof error === "string" ? error : error?.message || String(error);
+  const message = typeof error === "string" ? error : error?.message || String(error);
+  void invoke("write_log", { level: "ERROR", message: `右键菜单: ${message}` }).catch(() => {});
+  return message;
 }
 
 async function runAction(button) {

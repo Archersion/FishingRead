@@ -32,7 +32,9 @@ document.querySelector(".panel-header").addEventListener("pointerdown", (event) 
 document.querySelector("#panel-close").addEventListener("click", () => getCurrentWindow().close());
 
 function errorMessage(error) {
-  return typeof error === "string" ? error : error?.message || String(error);
+  const message = typeof error === "string" ? error : error?.message || String(error);
+  void invoke("write_log", { level: "ERROR", message: `网络书架: ${message}` }).catch(() => {});
+  return message;
 }
 
 function renderBooks() {

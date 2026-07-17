@@ -1,8 +1,9 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -18,6 +19,38 @@ use tauri::{
 const BOOKSHELF_TIMEOUT_SECS: u64 = 3;
 const CHAPTER_TIMEOUT_SECS: u64 = 10;
 const PROGRESS_TIMEOUT_SECS: u64 = 3;
+static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+fn append_log(level: &str, message: &str) -> Result<(), String> {
+    let path = LOG_FILE.get().ok_or_else(|| "日志文件尚未初始化".to_string())?;
+    let normalized_message = message.replace(['\r', '\n'], " ");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("打开日志文件失败: {error}"))?;
+    writeln!(
+        file,
+        "[{}] [{}] {}",
+        chrono_timestamp_millis(),
+        level,
+        normalized_message
+    )
+    .map_err(|error| format!("写入日志文件失败: {error}"))
+}
+
+fn initialize_logging() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|error| format!("获取程序路径失败: {error}"))?;
+    let install_dir = executable
+        .parent()
+        .ok_or_else(|| "无法确定程序安装目录".to_string())?;
+    let log_dir = install_dir.join("logs");
+    fs::create_dir_all(&log_dir).map_err(|error| format!("创建日志目录失败: {error}"))?;
+    let log_file = log_dir.join("fishing-read.log");
+    let _ = LOG_FILE.set(log_file.clone());
+    append_log("INFO", "鱼阅启动")?;
+    Ok(log_file)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -510,6 +543,18 @@ fn get_config(state: State<'_, AppState>) -> AppConfig {
 }
 
 #[tauri::command]
+fn write_log(level: String, message: String) -> Result<(), String> {
+    let level = match level.trim().to_ascii_uppercase().as_str() {
+        "INFO" => "INFO",
+        "WARN" => "WARN",
+        "ERROR" => "ERROR",
+        _ => "INFO",
+    };
+    let message: String = message.chars().take(4_000).collect();
+    append_log(level, &message)
+}
+
+#[tauri::command]
 fn save_config(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -819,6 +864,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_config,
+            write_log,
             save_config,
             show_context_menu,
             open_settings_window,
@@ -836,6 +882,12 @@ pub fn run() {
             quit_app,
         ])
         .setup(|app| {
+            if let Err(error) = initialize_logging() {
+                eprintln!("初始化日志失败: {error}");
+            }
+            std::panic::set_hook(Box::new(|panic_info| {
+                let _ = append_log("PANIC", &panic_info.to_string());
+            }));
             let config = read_config(app.handle());
             *app.state::<AppState>().config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = config.clone();
             if let Some(window) = app.get_webview_window("main") {

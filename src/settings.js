@@ -17,6 +17,9 @@ function normalizeColor(color, fallback) {
 }
 
 function showMessage(message, isError = false) {
+  if (isError) {
+    void invoke("write_log", { level: "ERROR", message: `阅读设置: ${String(message)}` }).catch(() => {});
+  }
   const element = document.querySelector("#settings-message");
   element.textContent = String(message);
   element.classList.toggle("error", isError);
@@ -101,6 +104,7 @@ function render(config) {
 invoke("get_config")
   .then(render)
   .catch((error) => {
+    void invoke("write_log", { level: "ERROR", message: `阅读设置加载: ${String(error)}` }).catch(() => {});
     app.innerHTML = `<main class="settings-load-error"><h1>设置加载失败</h1><p></p></main>`;
     app.querySelector("p").textContent = typeof error === "string" ? error : String(error);
   });

@@ -14,7 +14,9 @@ app.addEventListener("pointerdown", (event) => {
 });
 
 function errorMessage(error) {
-  return typeof error === "string" ? error : error?.message || String(error);
+  const message = typeof error === "string" ? error : error?.message || String(error);
+  void invoke("write_log", { level: "ERROR", message: `章节目录: ${message}` }).catch(() => {});
+  return message;
 }
 
 function render(context) {

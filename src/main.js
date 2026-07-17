@@ -17,6 +17,7 @@ document.querySelector("#app").innerHTML = `
   <main id="window-shell">
     <article id="reader" aria-live="polite">正在连接网络书架…</article>
     <div id="status" role="status"></div>
+    <div id="toast" class="toast hidden" role="alert"></div>
   </main>
 
   <div class="resize-handle resize-n" data-resize-direction="North"></div>
@@ -28,7 +29,6 @@ document.querySelector("#app").innerHTML = `
   <div class="resize-handle resize-sw" data-resize-direction="SouthWest"></div>
   <div class="resize-handle resize-nw" data-resize-direction="NorthWest"></div>
 
-  <div id="toast" class="toast hidden"></div>
 `;
 
 const shell = document.querySelector("#window-shell");
@@ -59,9 +59,17 @@ function setStatus(message = "") {
 
 let toastTimer;
 function showToast(message, isError = false) {
+  const text = String(message);
+  if (isError) {
+    void invoke("write_log", { level: "ERROR", message: text }).catch(() => {});
+  }
   clearTimeout(toastTimer);
-  toast.textContent = String(message);
+  toast.textContent = text;
   toast.classList.toggle("error", isError);
+  if (shell.classList.contains("ghost-hidden")) {
+    toast.classList.add("hidden");
+    return;
+  }
   toast.classList.remove("hidden");
   toastTimer = setTimeout(() => toast.classList.add("hidden"), 2800);
 }
@@ -128,8 +136,12 @@ function getVisibleRawPosition() {
   if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return appState.reader.progressPos || 0;
 
   const rect = reader.getBoundingClientRect();
-  const x = rect.left + 8;
-  const y = rect.top + 8;
+  const style = getComputedStyle(reader);
+  const paddingLeft = Number.parseFloat(style.paddingLeft) || 0;
+  const paddingTop = Number.parseFloat(style.paddingTop) || 0;
+  // 采样点必须位于正文区域内。落在左侧 padding 时，WebView 可能把命中位置返回为全文末尾。
+  const x = rect.left + paddingLeft + 2;
+  const y = rect.top + Math.max(2, Math.min(paddingTop + 2, reader.clientHeight - 2));
   let node;
   let offset;
 
@@ -143,16 +155,34 @@ function getVisibleRawPosition() {
     offset = range?.startOffset;
   }
 
-  if (node && Number.isInteger(offset)) {
-    const range = document.createRange();
-    range.setStart(textNode, 0);
-    range.setEnd(node, offset);
-    const codePointOffset = Array.from(range.toString()).length;
-    return clamp(codePointOffset - appState.reader.titlePrefixLen, 0, appState.reader.rawLength);
+  const fullLength = appState.reader.titlePrefixLen + appState.reader.rawLength;
+  // 使用全文高度估算当前屏顶部，而不是使用最大 scrollTop；否则最后一屏会被错误保存成全文末尾。
+  const estimatedFullPosition = reader.scrollHeight > 0
+    ? Math.round((reader.scrollTop / reader.scrollHeight) * fullLength)
+    : appState.reader.titlePrefixLen + (appState.reader.progressPos || 0);
+  const estimatedRawPosition = clamp(
+    estimatedFullPosition - appState.reader.titlePrefixLen,
+    0,
+    appState.reader.rawLength,
+  );
+
+  if (node === textNode && Number.isInteger(offset)) {
+    const codePointOffset = Array.from(textNode.data.slice(0, offset)).length;
+    const sampledRawPosition = clamp(
+      codePointOffset - appState.reader.titlePrefixLen,
+      0,
+      appState.reader.rawLength,
+    );
+    const visiblePageLength = reader.scrollHeight > 0
+      ? Math.max(1, Math.ceil((reader.clientHeight / reader.scrollHeight) * fullLength))
+      : fullLength;
+    // 命中结果偏离几何位置超过约一屏时视为 WebView 错误命中，改用稳定的比例估算。
+    if (Math.abs(sampledRawPosition - estimatedRawPosition) <= visiblePageLength * 1.5) {
+      return sampledRawPosition;
+    }
   }
 
-  const available = Math.max(1, reader.scrollHeight - reader.clientHeight);
-  return Math.round((reader.scrollTop / available) * appState.reader.rawLength);
+  return estimatedRawPosition;
 }
 
 function codePointToUtf16Index(text, codePointIndex) {
@@ -198,6 +228,7 @@ function renderEmpty(message) {
 async function syncProgress(remote = true) {
   if (!appState.reader || appState.loading) return;
   const progressPos = getVisibleRawPosition();
+  appState.reader.progressPos = progressPos;
   try {
     await invoke(remote ? "save_progress" : "update_progress", { progressPos });
     if (remote) appState.lastSavedAt = Date.now();
@@ -270,6 +301,8 @@ reader.addEventListener("pointerdown", (event) => {
 
 shell.addEventListener("mouseleave", () => {
   if (appState.config?.ghostMode) {
+    clearTimeout(toastTimer);
+    toast.classList.add("hidden");
     shell.classList.add("ghost-hidden");
   }
 });
