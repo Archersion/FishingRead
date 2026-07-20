@@ -1,9 +1,10 @@
 use std::{
     collections::BTreeMap,
+    error::Error as _,
     fs::{self, OpenOptions},
     io::Write,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -15,6 +16,7 @@ use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
     WindowEvent,
 };
+use tokio::sync::Mutex as AsyncMutex;
 
 const BOOKSHELF_TIMEOUT_SECS: u64 = 3;
 const CHAPTER_TIMEOUT_SECS: u64 = 10;
@@ -205,7 +207,8 @@ struct ReaderState {
 struct AppState {
     config: Mutex<AppConfig>,
     reader: Mutex<ReaderState>,
-    progress_save_lock: Arc<Mutex<()>>,
+    http_client: reqwest::Client,
+    progress_save_lock: AsyncMutex<()>,
 }
 
 impl Default for AppState {
@@ -213,7 +216,8 @@ impl Default for AppState {
         Self {
             config: Mutex::new(AppConfig::default()),
             reader: Mutex::new(ReaderState::default()),
-            progress_save_lock: Arc::new(Mutex::new(())),
+            http_client: reqwest::Client::new(),
+            progress_save_lock: AsyncMutex::new(()),
         }
     }
 }
@@ -376,20 +380,53 @@ fn endpoint(ip: &str, path: &str) -> Result<String, String> {
     Ok(format!("{}/{}", ip.trim_end_matches('/'), path.trim_start_matches('/')))
 }
 
-async fn fetch_chapters(ip: &str, book_url: &str) -> Result<Vec<Chapter>, String> {
+fn format_request_error(action: &str, error: reqwest::Error) -> String {
+    let category = if error.is_timeout() {
+        "请求超时"
+    } else if error.is_connect() {
+        "连接失败"
+    } else if error.is_status() {
+        "HTTP 状态异常"
+    } else if error.is_request() {
+        "请求构建失败"
+    } else if error.is_body() {
+        "响应体读取失败"
+    } else if error.is_decode() {
+        "响应解析失败"
+    } else {
+        "网络请求失败"
+    };
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    if causes.is_empty() {
+        format!("{action}（{category}）: {error}")
+    } else {
+        format!("{action}（{category}）: {error}; 原因: {}", causes.join(" -> "))
+    }
+}
+
+async fn fetch_chapters(
+    client: &reqwest::Client,
+    ip: &str,
+    book_url: &str,
+) -> Result<Vec<Chapter>, String> {
     let url = endpoint(ip, "getChapterList")?;
-    let response = reqwest::Client::new()
+    let response = client
         .get(url)
         .query(&[("url", book_url)])
         .timeout(Duration::from_secs(CHAPTER_TIMEOUT_SECS))
         .send()
         .await
-        .map_err(|error| format!("获取章节目录失败: {error}"))?
+        .map_err(|error| format_request_error("获取章节目录失败", error))?
         .error_for_status()
-        .map_err(|error| format!("获取章节目录失败: {error}"))?
+        .map_err(|error| format_request_error("获取章节目录失败", error))?
         .json::<ApiResponse<Vec<Chapter>>>()
         .await
-        .map_err(|error| format!("解析章节目录失败: {error}"))?;
+        .map_err(|error| format_request_error("解析章节目录失败", error))?;
 
     if response.is_success == Some(false) {
         return Err(response.error_msg.unwrap_or_else(|| "获取章节目录失败".to_string()));
@@ -397,21 +434,26 @@ async fn fetch_chapters(ip: &str, book_url: &str) -> Result<Vec<Chapter>, String
     Ok(response.data.unwrap_or_default())
 }
 
-async fn fetch_chapter_content(ip: &str, book_url: &str, index: usize) -> Result<String, String> {
+async fn fetch_chapter_content(
+    client: &reqwest::Client,
+    ip: &str,
+    book_url: &str,
+    index: usize,
+) -> Result<String, String> {
     let url = endpoint(ip, "getBookContent")?;
     let index_text = index.to_string();
-    let response = reqwest::Client::new()
+    let response = client
         .get(url)
         .query(&[("url", book_url), ("index", index_text.as_str())])
         .timeout(Duration::from_secs(CHAPTER_TIMEOUT_SECS))
         .send()
         .await
-        .map_err(|error| format!("读取章节失败: {error}"))?
+        .map_err(|error| format_request_error("读取章节失败", error))?
         .error_for_status()
-        .map_err(|error| format!("读取章节失败: {error}"))?
+        .map_err(|error| format_request_error("读取章节失败", error))?
         .json::<ApiResponse<String>>()
         .await
-        .map_err(|error| format!("解析章节内容失败: {error}"))?;
+        .map_err(|error| format_request_error("解析章节内容失败", error))?;
 
     if response.is_success == Some(false) {
         return Err(response.error_msg.unwrap_or_else(|| "读取章节失败".to_string()));
@@ -495,11 +537,10 @@ fn current_progress_snapshot(state: &AppState) -> Option<ProgressSnapshot> {
     })
 }
 
-fn post_progress_blocking(
+async fn post_progress(
+    client: &reqwest::Client,
     snapshot: ProgressSnapshot,
-    save_lock: Arc<Mutex<()>>,
 ) -> Result<(), String> {
-    let _guard = save_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let url = endpoint(&snapshot.ip, "saveBookProgress")?;
     let body = serde_json::json!({
         "name": snapshot.name,
@@ -509,14 +550,15 @@ fn post_progress_blocking(
         "durChapterTime": chrono_timestamp_millis(),
         "durChapterTitle": snapshot.chapter_title,
     });
-    reqwest::blocking::Client::new()
+    client
         .post(url)
         .json(&body)
         .timeout(Duration::from_secs(PROGRESS_TIMEOUT_SECS))
         .send()
-        .map_err(|error| format!("保存阅读进度失败: {error}"))?
+        .await
+        .map_err(|error| format_request_error("保存阅读进度失败", error))?
         .error_for_status()
-        .map_err(|error| format!("保存阅读进度失败: {error}"))?;
+        .map_err(|error| format_request_error("保存阅读进度失败", error))?;
     Ok(())
 }
 
@@ -527,14 +569,25 @@ fn chrono_timestamp_millis() -> u128 {
         .as_millis()
 }
 
-async fn sync_current_progress(state: &AppState) -> Result<(), String> {
-    let Some(snapshot) = current_progress_snapshot(state) else {
-        return Ok(());
+async fn sync_current_progress(
+    state: &AppState,
+    wait_for_existing: bool,
+) -> Result<bool, String> {
+    let _guard = if wait_for_existing {
+        state.progress_save_lock.lock().await
+    } else {
+        // 自动保存已有请求执行时合并本次保存，避免网络异常时积压重复任务。
+        match state.progress_save_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(false),
+        }
     };
-    let save_lock = state.progress_save_lock.clone();
-    tauri::async_runtime::spawn_blocking(move || post_progress_blocking(snapshot, save_lock))
-        .await
-        .map_err(|error| format!("等待进度保存任务失败: {error}"))?
+    // 获取锁后再读取快照，确保隐藏或退出等待期间产生的新位置能被最终保存。
+    let Some(snapshot) = current_progress_snapshot(state) else {
+        return Ok(true);
+    };
+    post_progress(&state.http_client, snapshot).await?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -660,17 +713,18 @@ fn get_reader_context(state: State<'_, AppState>) -> Result<ReaderContext, Strin
 async fn fetch_bookshelf(state: State<'_, AppState>) -> Result<Vec<Book>, String> {
     let ip = state.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).ip.clone();
     let url = endpoint(&ip, "getBookshelf")?;
-    let response = reqwest::Client::new()
+    let response = state
+        .http_client
         .get(url)
         .timeout(Duration::from_secs(BOOKSHELF_TIMEOUT_SECS))
         .send()
         .await
-        .map_err(|error| format!("获取网络书架失败: {error}"))?
+        .map_err(|error| format_request_error("获取网络书架失败", error))?
         .error_for_status()
-        .map_err(|error| format!("获取网络书架失败: {error}"))?
+        .map_err(|error| format_request_error("获取网络书架失败", error))?
         .json::<ApiResponse<Vec<Book>>>()
         .await
-        .map_err(|error| format!("解析网络书架失败: {error}"))?;
+        .map_err(|error| format_request_error("解析网络书架失败", error))?;
 
     if response.is_success == Some(false) {
         return Err(response.error_msg.unwrap_or_else(|| "获取网络书架失败".to_string()));
@@ -688,12 +742,14 @@ async fn select_book(
     if book.book_url.trim().is_empty() {
         return Err("书籍数据缺少 bookUrl，无法打开".to_string());
     }
-    sync_current_progress(&state).await?;
+    if let Err(error) = sync_current_progress(&state, false).await {
+        let _ = append_log("WARN", &format!("切换书籍前保存进度失败，继续加载: {error}"));
+    }
     let ip = state.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).ip.clone();
-    let chapters = fetch_chapters(&ip, &book.book_url).await?;
+    let chapters = fetch_chapters(&state.http_client, &ip, &book.book_url).await?;
     let index = usize::try_from(book.dur_chapter_index.max(0)).unwrap_or(0);
     let index = if chapters.is_empty() { index } else { index.min(chapters.len() - 1) };
-    let raw_content = fetch_chapter_content(&ip, &book.book_url, index).await?;
+    let raw_content = fetch_chapter_content(&state.http_client, &ip, &book.book_url, index).await?;
     let progress = usize::try_from(book.dur_chapter_pos.max(0)).unwrap_or(0);
     let payload = build_reader_payload(book, chapters, index, raw_content, progress, false);
     update_reader_from_payload(
@@ -714,7 +770,9 @@ async fn load_chapter(
     index: usize,
     scroll_to_bottom: bool,
 ) -> Result<ReaderPayload, String> {
-    sync_current_progress(&state).await?;
+    if let Err(error) = sync_current_progress(&state, false).await {
+        let _ = append_log("WARN", &format!("切换章节前保存进度失败，继续加载: {error}"));
+    }
     let (ip, book, chapters) = {
         let config = state.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         let reader = state.reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -724,7 +782,7 @@ async fn load_chapter(
     if !chapters.is_empty() && index >= chapters.len() {
         return Err("已经到达目录末尾".to_string());
     }
-    let raw_content = fetch_chapter_content(&ip, &book.book_url, index).await?;
+    let raw_content = fetch_chapter_content(&state.http_client, &ip, &book.book_url, index).await?;
     let payload = build_reader_payload(book, chapters, index, raw_content, 0, scroll_to_bottom);
     update_reader_from_payload(
         &mut state.reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
@@ -743,12 +801,12 @@ fn update_progress(state: State<'_, AppState>, progress_pos: usize) {
 }
 
 #[tauri::command]
-async fn save_progress(state: State<'_, AppState>, progress_pos: usize) -> Result<(), String> {
+async fn save_progress(state: State<'_, AppState>, progress_pos: usize) -> Result<bool, String> {
     {
         let mut reader = state.reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         reader.progress_pos = progress_pos.min(reader.raw_length);
     }
-    sync_current_progress(&state).await
+    sync_current_progress(&state, false).await
 }
 
 #[tauri::command]
@@ -763,7 +821,7 @@ async fn hide_window(
     }
     persist_window_geometry(&window, &state);
     window.hide().map_err(|error| error.to_string())?;
-    sync_current_progress(&state).await
+    sync_current_progress(&state, true).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -800,7 +858,7 @@ async fn quit_app(
         let mut reader = state.reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         reader.progress_pos = progress_pos.min(reader.raw_length);
     }
-    sync_current_progress(&state).await?;
+    sync_current_progress(&state, true).await?;
     persist_all_window_geometries(&app);
     app.exit(0);
     Ok(())
@@ -821,7 +879,7 @@ fn hide_main_window(app: &AppHandle) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app_handle.state::<AppState>();
-        let _ = sync_current_progress(&state).await;
+        let _ = sync_current_progress(&state, true).await;
     });
 }
 
@@ -829,7 +887,7 @@ fn exit_after_saving(app: &AppHandle) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app_handle.state::<AppState>();
-        let _ = sync_current_progress(&state).await;
+        let _ = sync_current_progress(&state, true).await;
         persist_all_window_geometries(&app_handle);
         app_handle.exit(0);
     });
@@ -938,7 +996,7 @@ pub fn run() {
                 let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppState>();
-                    let _ = sync_current_progress(&state).await;
+                    let _ = sync_current_progress(&state, true).await;
                 });
                 let _ = window.hide();
             }

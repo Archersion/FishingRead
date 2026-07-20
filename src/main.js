@@ -230,8 +230,8 @@ async function syncProgress(remote = true) {
   const progressPos = getVisibleRawPosition();
   appState.reader.progressPos = progressPos;
   try {
-    await invoke(remote ? "save_progress" : "update_progress", { progressPos });
-    if (remote) appState.lastSavedAt = Date.now();
+    const saved = await invoke(remote ? "save_progress" : "update_progress", { progressPos });
+    if (remote && saved) appState.lastSavedAt = Date.now();
   } catch (error) {
     if (remote) showToast(errorMessage(error), true);
   }
